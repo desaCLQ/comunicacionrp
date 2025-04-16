@@ -7,8 +7,6 @@ import torch
 import torch.nn as nn
 from torchvision import models, transforms
 from PIL import Image, ImageOps
-import tensorflow.keras.models as keras
-import tflite_runtime.interpreter as tflite
 import time
 from datetime import datetime
 import threading
@@ -18,6 +16,7 @@ import socket
 import os
 import logging
 from logging.handlers import RotatingFileHandler
+import onnxruntime as ort
 
 # --- Configuracion de log ---
 logging.basicConfig(
@@ -50,6 +49,12 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 model = None
 path_model = "./Modelos/mobilenetV3Small.pth"
 num_classes = 3  # Ajusta el número de clases según tu modelo
+
+# Variables globales
+device_custom = "cuda" if torch.cuda.is_available() else "cpu"
+model_custom = None
+path_model_custom = "./Modelos/custom_96x96x1_quantized.onnx"
+num_classes_custom = 3  # Solo relevante si haces post-procesamiento
 
 # Variable global para almacenar la conexión
 connection = None
@@ -90,6 +95,63 @@ def predict_pytorch(image_path):
     with torch.no_grad():
         outputs = model(image)
         return torch.argmax(outputs).item()
+
+
+def load_model_custom():
+    global model_custom
+    try:
+        model_custom = ort.InferenceSession(path_model_custom, providers=["CUDAExecutionProvider" if device_custom == "cuda" else "CPUExecutionProvider"])
+    except Exception as e:
+        logger.error(f"Error al cargar el modelo ONNX: {e}")
+    
+def load_image_custom(image_path: str) -> np.ndarray:
+    """
+    Procesa una imagen desde el path, la recorta desde el centro inferior,
+    la redimensiona, la convierte a escala de grises y la retorna como array NumPy normalizado.
+    """
+    try:
+        # Parámetros del recorte y redimensionado
+        target_crop = (224, 224)
+        target_size = (96, 96)
+
+        # Abrir imagen y convertir a escala de grises
+        img = Image.open(image_path).convert('L')
+        width, height = img.size
+
+        # Coordenadas del recorte
+        start_x = max(0, (width - target_crop[0]) // 2)
+        start_y = max(0, height - target_crop[1])
+        end_x = min(width, start_x + target_crop[0])
+        end_y = min(height, start_y + target_crop[1])
+        cropping_box = (start_x, start_y, end_x, end_y)
+
+        # Recorte y redimensionado
+        cropped_img = img.crop(cropping_box)
+        resized_img = cropped_img.resize(target_size, Image.LANCZOS)
+
+        # Convertir a NumPy array y normalizar
+        img_array = np.array(resized_img, dtype=np.float32) / 255.0
+
+        # Expandir dimensiones si se necesita para batch o canal (por ejemplo: [1, 96, 96, 1])
+        img_array = np.expand_dims(img_array, axis=-1)  # (96, 96, 1)
+        img_array = np.expand_dims(img_array, axis=0)   # (1, 96, 96, 1)
+
+        return img_array
+
+    except FileNotFoundError:
+        logger.error(f"Error: No se encontró la imagen en {image_path}")
+    except Exception as e:
+        logger.error(f"Ocurrió un error: {e}")
+        return None
+    
+def predict_custom(image_path):
+    input_name = model_custom.get_inputs()[0].name
+    output_name = model_custom.get_outputs()[0].name
+    image = load_image_custom(image_path)
+    outputs = model_custom.run([output_name], {input_name: image})
+    probabilities = np.exp(outputs[0]) / np.sum(np.exp(outputs[0]), axis=1, keepdims=True)  # Softmax
+    predicted_class = np.argmax(probabilities, axis=1)[0]
+    return predicted_class
 
 # --- Funciones de la base de datos ---
 def connect_db():
@@ -200,18 +262,24 @@ def procesar_imagenes():
 
             # Procesar con modelos
             clase_pytorch = predict_pytorch(image_path)
-
-            clase_tflite_caracter = '_'
+            clase_custom = predict_custom(image_path)
 
             if(clase_pytorch==0):
-              clase_pytorch_caracter = 'M'
+                clase_pytorch_caracter = 'M'
             elif (clase_pytorch==1):
-                 clase_pytorch_caracter = 'S'
+                clase_pytorch_caracter = 'S'
             else:
                clase_pytorch_caracter = 'T'
 
+            if(clase_custom==0):
+                clase_custom_caracter = 'M'
+            elif (clase_custom==1):
+                clase_custom_caracter = 'S'
+            else:
+                clase_custom_caracter = 'T'
+
             # Renombrar imagen
-            new_image_name = f"{timestamp}_{clase_tflite_caracter}{clase_pytorch_caracter}"
+            new_image_name = f"{timestamp}_{clase_custom_caracter}{clase_pytorch_caracter}"
             new_image_path = f"./images/{new_image_name}.jpg"
             os.rename(image_path, new_image_path)
 
@@ -317,6 +385,9 @@ def reconnect():
 def main():
     cargar_modelo_2()
     logger.info("Modelo PyTorch cargado.")
+
+    load_model_custom()
+    logger.info("Modelo Custom cargado.")
 
     #Inicializamos camara:
     inicializar_camara()
